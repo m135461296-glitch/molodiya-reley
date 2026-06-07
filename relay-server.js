@@ -20,7 +20,7 @@ const send = (ws, obj) => {
 
 const getOrCreateSession = (token) => {
     if (!sessions.has(token)) {
-        sessions.set(token, { host: null, guests: new Set(), createdAt: Date.now() });
+        sessions.set(token, { host: null, guests: new Set(), pending: new Map(), createdAt: Date.now() });
     }
     return sessions.get(token);
 };
@@ -93,15 +93,43 @@ wss.on('connection', (ws, req) => {
         // ── Guest join ────────────────────────────────────────────────────
         if (msg.type === 'join') {
             const session = getOrCreateSession(token);
-            session.guests.add(ws);
+            const guestId = `g-${Date.now()}-${Math.random().toString(36).slice(2,7)}`;
+            ws._guestId = guestId;
             role = 'guest';
-            console.log(`[Relay] Guest joined ${token.slice(0,8)}… (${session.guests.size} total)`);
             if (session.host) {
-                send(session.host, { type: 'guest-joined', guestCount: session.guests.size });
-                send(ws, { type: 'connected', message: 'Connected via relay' });
+                // Put guest in pending until host approves
+                session.pending.set(guestId, ws);
+                console.log(`[Relay] Guest pending approval ${guestId} token:${token.slice(0,8)}…`);
+                send(session.host, { type: 'guest-joined', guestId });
             } else {
                 send(ws, { type: 'waiting', message: 'Waiting for host PC…' });
             }
+            return;
+        }
+
+        // ── Host approves guest ────────────────────────────────────────────
+        if (msg.type === 'approve-guest') {
+            const session = sessions.get(token);
+            if (!session) return;
+            const guestWs = session.pending.get(msg.guestId);
+            if (!guestWs) return;
+            session.pending.delete(msg.guestId);
+            session.guests.add(guestWs);
+            console.log(`[Relay] Guest approved ${msg.guestId} (${session.guests.size} total)`);
+            send(guestWs, { type: 'connected', message: 'Connected via relay' });
+            send(session.host, { type: 'guest-approved-ack', guestCount: session.guests.size });
+            return;
+        }
+
+        // ── Host rejects guest ─────────────────────────────────────────────
+        if (msg.type === 'reject-guest') {
+            const session = sessions.get(token);
+            if (!session) return;
+            const guestWs = session.pending.get(msg.guestId);
+            if (!guestWs) return;
+            session.pending.delete(msg.guestId);
+            console.log(`[Relay] Guest rejected ${msg.guestId}`);
+            send(guestWs, { type: 'guest-rejected' });
             return;
         }
 
@@ -137,8 +165,11 @@ wss.on('connection', (ws, req) => {
             session.host = null;
             console.log(`[Relay] Host left ${myToken.slice(0,8)}…`);
             for (const g of session.guests) send(g, { type: 'host-disconnected' });
+            for (const g of session.pending.values()) send(g, { type: 'host-disconnected' });
+            session.pending.clear();
         } else if (role === 'guest') {
             session.guests.delete(ws);
+            if (ws._guestId) session.pending.delete(ws._guestId);
             console.log(`[Relay] Guest left ${myToken.slice(0,8)}… (${session.guests.size} remaining)`);
             if (session.host) send(session.host, { type: 'guest-left', guestCount: session.guests.size });
         }
