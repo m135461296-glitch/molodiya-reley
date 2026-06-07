@@ -184,3 +184,22 @@ setInterval(() => {
         }
     }
 }, 30 * 60 * 1000);
+
+// ── Self-ping keep-alive (every 4 min) ───────────────────────────────────────
+// Prevents Railway/Render from sleeping the service due to inactivity.
+const SELF_URL = process.env.RAILWAY_PUBLIC_DOMAIN
+    ? `http://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+    : null;
+
+if (SELF_URL) {
+    setInterval(() => {
+        http.get(SELF_URL, (res) => {
+            console.log(`[KeepAlive] Ping → ${res.statusCode}`);
+        }).on('error', (err) => {
+            console.warn('[KeepAlive] Ping failed:', err.message);
+        });
+    }, 4 * 60 * 1000); // every 4 minutes
+    console.log(`[KeepAlive] Self-ping enabled → ${SELF_URL}`);
+} else {
+    console.log('[KeepAlive] No RAILWAY_PUBLIC_DOMAIN set — self-ping disabled');
+}
