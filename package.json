@@ -1,15 +1,15 @@
 {
-  "name": "molodiya-reley",
-  "version": "1.0.0",
+  "name": "melodiya-relay",
+  "version": "2.0.0",
+  "description": "WebSocket relay server for Melodiya Pro cross-device feature",
   "main": "relay-server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node relay-server.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "description": "",
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
-    "ws": "^8.21.0"
+    "ws": "^8.18.0"
   }
 }

@@ -1,19 +1,9 @@
 'use strict';
 
 /**
- * relay-server.js
- * ───────────────
- * Deploy this once to Railway / Render / Fly.io.
- * It brokers WebSocket messages between the Melodiya PC (host) and
- * any number of phone clients (guests) using a shared session token.
- *
- * Message flow:
- *   PC  →  relay: { type: 'register-host', token }
- *   Phone → relay: { type: 'join', token }
- *   PC  →  relay: { type: 'deck-state', ... }       ← forwarded to all phones
- *   Phone → relay: { type: 'toggle-play', ... }     ← forwarded to host PC
- *
- * Health check: GET / → 200 OK  (for Railway/Render uptime checks)
+ * relay-server.js — Melodiya Relay v2
+ * Deploy to Railway. Brokers WebSocket messages between
+ * the Melodiya PC (host) and phone clients (guests).
  */
 
 const { WebSocketServer } = require('ws');
@@ -21,19 +11,16 @@ const http = require('http');
 
 const PORT = process.env.PORT || 8080;
 
-// token → { host: WebSocket | null, guests: Set<WebSocket> }
+// token → { host: WebSocket | null, guests: Set<WebSocket>, createdAt }
 const sessions = new Map();
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
 const send = (ws, obj) => {
-    if (ws && ws.readyState === 1) {
-        ws.send(JSON.stringify(obj));
-    }
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
 };
 
 const getOrCreateSession = (token) => {
     if (!sessions.has(token)) {
-        sessions.set(token, { host: null, guests: new Set() });
+        sessions.set(token, { host: null, guests: new Set(), createdAt: Date.now() });
     }
     return sessions.get(token);
 };
@@ -43,69 +30,73 @@ const cleanupSession = (token) => {
     if (!s) return;
     if (!s.host && s.guests.size === 0) {
         sessions.delete(token);
-        console.log(`[Relay] Session removed: ${token.slice(0, 8)}… (${sessions.size} active)`);
+        console.log(`[Relay] Session cleaned: ${token.slice(0,8)}… (${sessions.size} active)`);
     }
 };
 
-// ── HTTP server (health check + WebSocket upgrade) ────────────────────────────
+// ── HTTP server ───────────────────────────────────────────────────────────────
 const httpServer = http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end(`Melodiya Relay OK — ${sessions.size} active session(s)\n`);
+    // Health check — Railway needs this to confirm the service is up
+    if (req.method === 'GET' && (req.url === '/' || req.url === '/health')) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            status: 'ok',
+            service: 'Melodiya Relay',
+            sessions: sessions.size,
+            uptime: Math.floor(process.uptime()),
+        }));
+        return;
+    }
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.end('Not found');
 });
 
 // ── WebSocket server ──────────────────────────────────────────────────────────
 const wss = new WebSocketServer({ server: httpServer });
 
 wss.on('connection', (ws, req) => {
-    const url   = new URL(req.url, `http://localhost`);
+    const url   = new URL(req.url, 'http://localhost');
     const token = url.searchParams.get('token');
 
-    if (!token) {
-        ws.close(4000, 'Missing token');
-        return;
-    }
+    if (!token) { ws.close(4000, 'Missing token'); return; }
 
-    let role       = null;   // 'host' | 'guest'
-    let myToken    = token;
+    let role    = null;
+    let myToken = token;
 
-    console.log(`[Relay] New WS connection, token: ${token.slice(0, 8)}…`);
+    console.log(`[Relay] Connection — token: ${token.slice(0,8)}…`);
+
+    // Heartbeat — keep connection alive through Railway's idle timeout
+    const pingInterval = setInterval(() => {
+        if (ws.readyState === 1) ws.ping();
+    }, 25000);
+
+    ws.on('pong', () => { /* alive */ });
 
     ws.on('message', (raw) => {
         let msg;
         try { msg = JSON.parse(raw.toString()); } catch { return; }
 
-        // ── Host registration ─────────────────────────────────────────────────
+        // ── Host registration ─────────────────────────────────────────────
         if (msg.type === 'register-host') {
             const session = getOrCreateSession(token);
-
-            // Kick any stale host
             if (session.host && session.host !== ws) {
                 session.host.close(4001, 'Replaced by new host');
             }
-
             session.host = ws;
             role = 'host';
-
-            console.log(`[Relay] Host registered for ${token.slice(0, 8)}… (${session.guests.size} guests waiting)`);
+            console.log(`[Relay] Host registered ${token.slice(0,8)}… (${session.guests.size} guests)`);
             send(ws, { type: 'host-registered', guestCount: session.guests.size });
-
-            // If guests were already waiting, tell them the host arrived
-            for (const g of session.guests) {
-                send(g, { type: 'host-ready' });
-            }
+            for (const g of session.guests) send(g, { type: 'host-ready' });
             return;
         }
 
-        // ── Guest join ────────────────────────────────────────────────────────
+        // ── Guest join ────────────────────────────────────────────────────
         if (msg.type === 'join') {
             const session = getOrCreateSession(token);
             session.guests.add(ws);
             role = 'guest';
-
-            console.log(`[Relay] Guest joined ${token.slice(0, 8)}… (${session.guests.size} total guests)`);
-
+            console.log(`[Relay] Guest joined ${token.slice(0,8)}… (${session.guests.size} total)`);
             if (session.host) {
-                // Ask host for a fresh deck-state push
                 send(session.host, { type: 'guest-joined', guestCount: session.guests.size });
                 send(ws, { type: 'connected', message: 'Connected via relay' });
             } else {
@@ -114,19 +105,14 @@ wss.on('connection', (ws, req) => {
             return;
         }
 
-        // ── Host → broadcast to all guests ───────────────────────────────────
+        // ── Host → broadcast to guests ────────────────────────────────────
         if (role === 'host') {
             const session = sessions.get(token);
             if (!session) return;
-
-            // Handle host session-end
             if (msg.type === 'session-ended') {
-                for (const g of session.guests) {
-                    send(g, { type: 'session-ended' });
-                }
+                for (const g of session.guests) send(g, { type: 'session-ended' });
                 return;
             }
-
             const outgoing = JSON.stringify(msg);
             for (const g of session.guests) {
                 if (g.readyState === 1) g.send(outgoing);
@@ -134,7 +120,7 @@ wss.on('connection', (ws, req) => {
             return;
         }
 
-        // ── Guest → forward to host ───────────────────────────────────────────
+        // ── Guest → forward to host ───────────────────────────────────────
         if (role === 'guest') {
             const session = sessions.get(token);
             if (!session || !session.host) return;
@@ -144,62 +130,52 @@ wss.on('connection', (ws, req) => {
     });
 
     ws.on('close', () => {
+        clearInterval(pingInterval);
         const session = sessions.get(myToken);
         if (!session) return;
-
         if (role === 'host') {
             session.host = null;
-            console.log(`[Relay] Host disconnected from ${myToken.slice(0, 8)}…`);
-            for (const g of session.guests) {
-                send(g, { type: 'host-disconnected' });
-            }
+            console.log(`[Relay] Host left ${myToken.slice(0,8)}…`);
+            for (const g of session.guests) send(g, { type: 'host-disconnected' });
         } else if (role === 'guest') {
             session.guests.delete(ws);
-            console.log(`[Relay] Guest left ${myToken.slice(0, 8)}… (${session.guests.size} remaining)`);
-            if (session.host) {
-                send(session.host, { type: 'guest-left', guestCount: session.guests.size });
-            }
+            console.log(`[Relay] Guest left ${myToken.slice(0,8)}… (${session.guests.size} remaining)`);
+            if (session.host) send(session.host, { type: 'guest-left', guestCount: session.guests.size });
         }
-
         cleanupSession(myToken);
     });
 
-    ws.on('error', (err) => {
-        console.error('[Relay] WS error:', err.message);
-    });
+    ws.on('error', (err) => console.error('[Relay] WS error:', err.message));
 });
 
-httpServer.listen(PORT, () => {
-    console.log(`[Relay] Listening on port ${PORT}`);
+httpServer.listen(PORT, '0.0.0.0', () => {
+    console.log(`[Relay] Listening on 0.0.0.0:${PORT}`);
 });
 
-// ── Periodic stale-session cleanup (every 30 min) ────────────────────────────
+// ── Stale session cleanup every 30 min ───────────────────────────────────────
 setInterval(() => {
     for (const [token, s] of sessions.entries()) {
-        const hostDead  = !s.host || s.host.readyState > 1;
+        const hostDead   = !s.host || s.host.readyState > 1;
         const guestsDead = [...s.guests].every(g => g.readyState > 1);
         if (hostDead && guestsDead) {
             sessions.delete(token);
-            console.log(`[Relay] Pruned dead session ${token.slice(0, 8)}…`);
+            console.log(`[Relay] Pruned dead session ${token.slice(0,8)}…`);
         }
     }
 }, 30 * 60 * 1000);
 
-// ── Self-ping keep-alive (every 4 min) ───────────────────────────────────────
-// Prevents Railway/Render from sleeping the service due to inactivity.
+// ── Self-ping keep-alive every 4 min ─────────────────────────────────────────
 const SELF_URL = process.env.RAILWAY_PUBLIC_DOMAIN
-    ? `http://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+    ? `http://${process.env.RAILWAY_PUBLIC_DOMAIN}/health`
     : null;
 
 if (SELF_URL) {
     setInterval(() => {
         http.get(SELF_URL, (res) => {
-            console.log(`[KeepAlive] Ping → ${res.statusCode}`);
+            console.log(`[KeepAlive] ${res.statusCode}`);
         }).on('error', (err) => {
-            console.warn('[KeepAlive] Ping failed:', err.message);
+            console.warn('[KeepAlive] Failed:', err.message);
         });
-    }, 4 * 60 * 1000); // every 4 minutes
-    console.log(`[KeepAlive] Self-ping enabled → ${SELF_URL}`);
-} else {
-    console.log('[KeepAlive] No RAILWAY_PUBLIC_DOMAIN set — self-ping disabled');
+    }, 4 * 60 * 1000);
+    console.log(`[KeepAlive] Pinging ${SELF_URL}`);
 }
