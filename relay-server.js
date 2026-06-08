@@ -273,7 +273,7 @@ wss.on('connection', (ws, req) => {
     });
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
     console.log(`[relay] Melodiya Relay Server v2 running on port ${PORT}`);
 });
 
@@ -286,3 +286,4 @@ setInterval(() => {
     }
     console.log(`[relay] Cleanup done. Active sessions: ${sessions.size}`);
 }, 10 * 60 * 1000);
+// cache-bust 06/08/2026 16:23:37
